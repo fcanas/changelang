@@ -130,7 +130,9 @@ func getAudioTracks(filePath: String, ffprobeURL: URL) -> [FFProbeStream]? {
 func setDefaultAudioTrack(inputFilePath: String, ffmpegURL: URL, audioTrackIndexToSetAsDefault: Int) -> Bool {
     let inputFileURL = URL(fileURLWithPath: inputFilePath)
     let tempFileName = UUID().uuidString + "." + inputFileURL.pathExtension
-    let tempFileURL = FileManager.default.temporaryDirectory.appendingPathComponent(tempFileName)
+    // Create temporary file in the same directory as the input file
+    let tempFileDirectory = inputFileURL.deletingLastPathComponent()
+    let tempFileURL = tempFileDirectory.appendingPathComponent(tempFileName)
 
     defer {
         try? FileManager.default.removeItem(at: tempFileURL)

@@ -13,7 +13,7 @@ file_extension=$1
 
 find . -type f -name "*.$file_extension" | while read -r file; do
     echo "Processing $file"
-    changelang.swift "$file" -l eng
+    changelang "$file" -l eng
 done
 
 
