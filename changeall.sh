@@ -4,16 +4,16 @@
 # and run the program `changelang.swift` on each file with the additional parameters "-l eng"
 
 if [ $# -ne 1 ]; then
-    echo "Usage: $0 <file_extension>"
+    echo "Usage: $0 <file_extension> <language_code>"
     exit 1
 fi
 
 file_extension=$1
-
+language_code=$2
 
 find . -type f -name "*.$file_extension" | while read -r file; do
     echo "Processing $file"
-    changelang "$file" -l eng
+    changelang "$file" -l $language_code
 done
 
 
