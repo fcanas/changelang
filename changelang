@@ -73,6 +73,7 @@ struct FFProbeStream: Codable {
 
     struct StreamTags: Codable {
         let language: String?
+        let title: String?
     }
 
     struct StreamDisposition: Codable {
@@ -94,6 +95,10 @@ struct FFProbeStream: Codable {
     var isAudio: Bool { // Though ffprobe -select_streams a should pre-filter
         return codec_type == "audio"
     }
+
+    var isSubtitle: Bool {
+        return codec_type == "subtitle"
+    }
 }
 
 struct FFProbeOutput: Codable {
@@ -102,27 +107,28 @@ struct FFProbeOutput: Codable {
 
 // MARK: - Core Logic Functions
 
-func getAudioTracks(filePath: String, ffprobeURL: URL) -> [FFProbeStream]? {
+// Fetches streams of a specific type (e.g., "a" for audio, "s" for subtitle)
+func getStreams(filePath: String, ffprobeURL: URL, streamSpecifier: String) -> [FFProbeStream]? {
     do {
-        let arguments = ["-v", "quiet", "-print_format", "json", "-show_streams", "-select_streams", "a", filePath]
+        let arguments = ["-v", "quiet", "-print_format", "json", "-show_streams", "-select_streams", streamSpecifier, filePath]
         let (status, stdout, stderr) = try runProcess(executableURL: ffprobeURL, arguments: arguments)
 
         if status != 0 {
-            print("Error: ffprobe failed (Status: \(status)).")
+            print("Error: ffprobe failed for stream type '\(streamSpecifier)' (Status: \(status)).")
             if !stderr.isEmpty { print("ffprobe stderr: \(stderr)") }
             return nil
         }
 
         guard let jsonData = stdout.data(using: .utf8) else {
-            print("Error: Could not convert ffprobe output to Data.")
+            print("Error: Could not convert ffprobe output to Data for stream type '\(streamSpecifier)'.")
             return nil
         }
         
         let decoder = JSONDecoder()
         let ffprobeData = try decoder.decode(FFProbeOutput.self, from: jsonData)
-        return ffprobeData.streams // These are already audio streams due to "-select_streams a"
+        return ffprobeData.streams
     } catch {
-        print("Error processing ffprobe output: \(error)")
+        print("Error processing ffprobe output for stream type '\(streamSpecifier)': \(error)")
         return nil
     }
 }
@@ -179,28 +185,131 @@ func setDefaultAudioTrack(inputFilePath: String, ffmpegURL: URL, audioTrackIndex
     }
 }
 
+// If subtitleTrackIndexToSetAsDefault is nil, it means clear all defaults.
+// Otherwise, it's the 0-indexed Nth subtitle stream to set as default.
+func setDefaultSubtitleTrack(inputFilePath: String, ffmpegURL: URL, subtitleTrackIndexToSetAsDefault: Int?) -> Bool {
+    let inputFileURL = URL(fileURLWithPath: inputFilePath)
+    let tempFileName = UUID().uuidString + "." + inputFileURL.pathExtension
+    let tempFileDirectory = inputFileURL.deletingLastPathComponent()
+    let tempFileURL = tempFileDirectory.appendingPathComponent(tempFileName)
+
+    defer {
+        try? FileManager.default.removeItem(at: tempFileURL)
+    }
+
+    var ffmpegArguments = [
+        "-y",
+        "-i", inputFilePath,
+        "-map", "0",
+        "-c", "copy",
+        "-disposition:s", "0" // Clear default flag from all subtitle streams first
+    ]
+
+    if let trackIndex = subtitleTrackIndexToSetAsDefault {
+        // Set the new default subtitle track. `:s:N` refers to the Nth subtitle stream.
+        // N here is 0-indexed relative to the count of subtitle streams.
+        ffmpegArguments.append("-disposition:s:\(trackIndex)")
+        ffmpegArguments.append("default")
+    } 
+    // If trackIndex is nil, we only clear defaults, no further args needed for disposition.
+    
+    ffmpegArguments.append(tempFileURL.path)
+
+    do {
+        print("  ffmpeg \(ffmpegArguments.joined(separator: " "))") 
+        let (status, _, _) = try runProcess(executableURL: ffmpegURL, arguments: ffmpegArguments)
+
+        if status == 0 {
+            do {
+                _ = try FileManager.default.replaceItemAt(inputFileURL, withItemAt: tempFileURL, backupItemName: nil, options: [])
+                if subtitleTrackIndexToSetAsDefault != nil {
+                    print("Successfully updated default subtitle track in '\(inputFilePath)'.")
+                } else {
+                    print("Successfully cleared default subtitle track in '\(inputFilePath)'.")
+                }
+                return true
+            } catch {
+                print("Error: Could not replace original file '\(inputFilePath)' with temporary file '\(tempFileURL.path)'.")
+                print("Error details: \(error)")
+                return false
+            }
+        } else {
+            print("Error: ffmpeg failed to modify subtitle track (Status: \(status)).")
+            return false
+        }
+    } catch {
+        print("Error running ffmpeg for subtitle track modification: \(error)")
+        return false
+    }
+}
+
 
 // --- Main Script Logic ---
 
+func printUsage() {
+    let scriptName = CommandLine.arguments.count > 0 ? CommandLine.arguments[0] : "changelang"
+    print("Usage: \(scriptName) <input_file.mkv> [-a <audio_lang_code>] [-s <subtitle_lang_code>]")
+    print("Description:")
+    print("  Changes the default audio track of a media file. Can optionally target a specific language.")
+    print("  Subtitle language selection is parsed but not yet implemented.")
+    print("Options:")
+    print("  <input_file.mkv>         : Path to the media file (required).")
+    print("  -a <audio_lang_code>     : Set default audio track to the first found with this language code (e.g., eng, jpn).")
+    print("  -s <subtitle_lang_code>  : (Not yet implemented) Set default subtitle track by language code.")
+}
+
 // 1. Argument Parsing
 var inputFilePath: String? = nil
-var targetLanguage: String? = nil
+var targetAudioLanguage: String? = nil
+var targetSubtitleLanguage: String? = nil
 
-if CommandLine.arguments.count == 2 {
-    inputFilePath = CommandLine.arguments[1]
-} else if CommandLine.arguments.count == 4 && CommandLine.arguments[2] == "-l" {
-    inputFilePath = CommandLine.arguments[1]
-    targetLanguage = CommandLine.arguments[3].lowercased()
-} else {
-    print("Usage: \(CommandLine.arguments[0]) <input_file.mkv> [-l <language_code>]")
-    exit(1)
+enum ArgumentFlag: String {
+    case audio = "-a"
+    case subtitle = "-s"
 }
 
+var i = 1 // Start after the script name
+while i < CommandLine.arguments.count {
+    let currentArg = CommandLine.arguments[i]
+    switch ArgumentFlag(rawValue: currentArg) {
+    case .audio:
+        if i + 1 < CommandLine.arguments.count {
+            targetAudioLanguage = CommandLine.arguments[i+1].lowercased()
+            i += 2 // Consumed flag and value
+        } else {
+            print("Error: Missing language code for -a option.")
+            printUsage()
+            exit(1)
+        }
+    case .subtitle:
+        if i + 1 < CommandLine.arguments.count {
+            targetSubtitleLanguage = CommandLine.arguments[i+1].lowercased()
+            i += 2 // Consumed flag and value
+        } else {
+            print("Error: Missing language code for -s option.")
+            printUsage()
+            exit(1)
+        }
+    default:
+        // If it's not a flag, and we haven't found the input file yet, assume it's the input file.
+        if inputFilePath == nil {
+            inputFilePath = currentArg
+            i += 1
+        } else if inputFilePath != nil {
+            print("Error: Unexpected argument '\(currentArg)' after input file path.")
+            printUsage()
+            exit(1)
+        }
+    }
+}
+
+// Check for mandatory input file
 guard let guardedInputFilePath = inputFilePath else {
-    // This case should ideally not be reached due to the logic above
-    print("Error: Input file path could not be determined.")
+    print("Error: Input file path is required.")
+    printUsage()
     exit(1)
 }
+
 let inputFileURL = URL(fileURLWithPath: guardedInputFilePath)
 
 
@@ -211,81 +320,167 @@ guard FileManager.default.fileExists(atPath: guardedInputFilePath) else {
 }
 
 // 3. Find ffmpeg and ffprobe dynamically
-print("Resolving dependencies...")
 guard let ffmpegURL = findExecutable(named: "ffmpeg") else {
     exit(1) // Error message printed within findExecutable
 }
-print("  ffmpeg:  \(ffmpegURL.path)")
 
 guard let ffprobeURL = findExecutable(named: "ffprobe") else {
     exit(1) // Error message printed within findExecutable
 }
-print("  ffprobe: \(ffprobeURL.path)")
 
-// 4. Get Audio Tracks
-guard let audioTracks = getAudioTracks(filePath: guardedInputFilePath, ffprobeURL: ffprobeURL) else {
+// 4. Get Audio and Subtitle Tracks
+guard let audioTracks = getStreams(filePath: guardedInputFilePath, ffprobeURL: ffprobeURL, streamSpecifier: "a") else {
     print("Error: Could not retrieve audio tracks from the file.")
     exit(1)
 }
 
-if audioTracks.isEmpty {
-    print("No audio tracks found in the file.")
+let subtitleTracks = getStreams(filePath: guardedInputFilePath, ffprobeURL: ffprobeURL, streamSpecifier: "s") ?? []
+
+if audioTracks.isEmpty && subtitleTracks.isEmpty {
+    print("No audio or subtitle tracks found in the file.")
     exit(0)
 }
 
-// 5. Mode Handling
-if let langCode = targetLanguage {
-    // Language code mode
-    var foundTrackIndex: Int? = nil
-    for (index, track) in audioTracks.enumerated() {
-        if track.language.lowercased() == langCode {
-            foundTrackIndex = index
-            break
+// 5. Planning
+var plannedAudioActionIndex: Int? = nil
+var plannedSubtitleActionIndex: Int? = nil
+var plannedSubtitleClearAction: Bool = false
+
+let anyArgumentsProvided = targetAudioLanguage != nil || targetSubtitleLanguage != nil
+
+if anyArgumentsProvided {
+
+    if let audioLangCode = targetAudioLanguage {
+        var foundTrackIndex: Int? = nil
+        for (index, track) in audioTracks.enumerated() {
+            if track.language.lowercased() == audioLangCode {
+                foundTrackIndex = index
+                break
+            }
+        }
+        if let trackIdx = foundTrackIndex {
+            plannedAudioActionIndex = trackIdx
+        } else {
+            print("  - Audio language '\(audioLangCode)' not found. No audio changes.")
         }
     }
 
-    if let trackIdx = foundTrackIndex {
-        print("Found audio track with language '\(langCode)' at index \(trackIdx + 1). Setting as default.")
-        if setDefaultAudioTrack(inputFilePath: guardedInputFilePath, ffmpegURL: ffmpegURL, audioTrackIndexToSetAsDefault: trackIdx) {
-            // Success message printed in setDefaultAudioTrack
+    if let subtitleInstruction = targetSubtitleLanguage {
+        if subtitleInstruction == "0" {
+            plannedSubtitleClearAction = true
         } else {
-            print("Failed to set default audio track.")
-            exit(1)
+            var foundSubtitleTrackIndex: Int? = nil
+            for (index, track) in subtitleTracks.enumerated() {
+                if track.language.lowercased() == subtitleInstruction {
+                    foundSubtitleTrackIndex = index
+                    break
+                }
+            }
+            if let trackIdx = foundSubtitleTrackIndex {
+                plannedSubtitleActionIndex = trackIdx
+            } else {
+                print("  - Subtitle language '\(subtitleInstruction)' not found.")
+            }
         }
-    } else {
-        print("No audio track found matching language code '\(langCode)'. No changes made.")
-        exit(0)
     }
 } else {
-    // Interactive mode
-    print("\nAvailable audio tracks:")
-    for (i, track) in audioTracks.enumerated() {
-        let displayIndex = i + 1
-        let defaultMarker = track.isDefault ? "*" : " "
-        let lang = track.language
-        let codec = track.codec_name ?? "N/A"
-        let sampleRate = track.sample_rate ?? "N/A"
-        let layout = track.channel_layout ?? (track.channels != nil ? "\(track.channels!) ch" : "N/A")
-        let format = track.sample_fmt ?? ""
-        print("[\(displayIndex)] \(defaultMarker) (\(lang)): \(codec), \(sampleRate) Hz, \(layout)\(format.isEmpty ? "" : ", \(format)")")
-    }
-
-    print("\nSet default (enter number, or leave blank to cancel): ", terminator: "")
-    if let choiceStr = readLine(), !choiceStr.isEmpty {
-        if let choiceNum = Int(choiceStr), choiceNum >= 1 && choiceNum <= audioTracks.count {
-            let selectedTrackIndex = choiceNum - 1 // 0-indexed
-            if setDefaultAudioTrack(inputFilePath: guardedInputFilePath, ffmpegURL: ffmpegURL, audioTrackIndexToSetAsDefault: selectedTrackIndex) {
-                 // Success message printed in setDefaultAudioTrack
+    // Interactive Audio selection
+    if audioTracks.isEmpty {
+        print("  No audio tracks found to select a default.")
+    } else {
+        print("\nAvailable audio tracks:")
+        for (i, track) in audioTracks.enumerated() {
+            let displayIndex = i + 1
+            let defaultMarker = track.isDefault ? "*" : " "
+            let lang = track.language
+            let codec = track.codec_name ?? "N/A"
+            let sampleRate = track.sample_rate ?? "N/A"
+            let layout = track.channel_layout ?? (track.channels != nil ? "\(track.channels!) ch" : "N/A")
+            let format = track.sample_fmt ?? ""
+            print("  [\(displayIndex)] \(defaultMarker) (\(lang)): \(codec), \(sampleRate) Hz, \(layout)\(format.isEmpty ? "" : ", \(format)")")
+        }
+        print("\n  Set default audio track (enter number from audio list, or leave blank to skip): ", terminator: "")
+        if let choiceStr = readLine(), !choiceStr.isEmpty {
+            if let choiceNum = Int(choiceStr), choiceNum >= 1 && choiceNum <= audioTracks.count {
+                plannedAudioActionIndex = choiceNum - 1
             } else {
-                print("Failed to set default audio track.")
-                exit(1)
+                print("    Invalid audio selection or no selection. Skipping audio change.")
             }
         } else {
-            print("Invalid selection. No changes made.")
-            exit(1)
+            print("    Skipping audio change.")
         }
-    } else {
-        print("No selection made. File not changed.")
-        exit(0)
     }
+
+    // Interactive Subtitle selection
+    if subtitleTracks.isEmpty {
+        print("\n  No subtitle tracks found to select a default.")
+    } else {
+        print("\nAvailable subtitle tracks:")
+        for (i, track) in subtitleTracks.enumerated() {
+            let displayIndex = i + 1
+            let defaultMarker = track.isDefault ? "*" : " "
+            let lang = track.language
+            let codec = track.codec_name ?? "N/A"
+            let titleDisplay = track.tags?.title ?? ""
+            let titleText = titleDisplay.isEmpty ? "" : " title: \(titleDisplay)"
+            print("  [\(displayIndex)] \(defaultMarker) (\(lang))\(titleText): \(codec)")
+        }
+        print("\n  Set default subtitle track (enter number, 0 to clear all, or leave blank to skip): ", terminator: "")
+        if let choiceStr = readLine(), !choiceStr.isEmpty {
+            if let choiceNum = Int(choiceStr) {
+                if choiceNum == 0 {
+                    plannedSubtitleClearAction = true
+                    print("    Selected to clear all default subtitle tracks.")
+                } else if choiceNum >= 1 && choiceNum <= subtitleTracks.count {
+                    plannedSubtitleActionIndex = choiceNum - 1
+                } else {
+                    print("    Invalid subtitle selection. Skipping subtitle change.")
+                }
+            } else {
+                print("    Invalid input for subtitle selection. Skipping subtitle change.")
+            }
+        } else {
+            print("    Skipping subtitle change.")
+        }
+    }
+}
+
+// 6. Execution Phase
+var audioChangeSuccess: Bool? = nil
+var subtitleChangeSuccess: Bool? = nil
+
+if plannedAudioActionIndex == nil,
+ plannedSubtitleActionIndex == nil,
+ plannedSubtitleClearAction == false {
+    print("No actions planned. Exiting.")
+    exit(anyArgumentsProvided ? 0 : 1)
+}
+
+if let audioIndex = plannedAudioActionIndex {
+    if setDefaultAudioTrack(inputFilePath: guardedInputFilePath, ffmpegURL: ffmpegURL, audioTrackIndexToSetAsDefault: audioIndex) {
+        audioChangeSuccess = true
+    } else {
+        audioChangeSuccess = false
+        print("Error: Setting default audio track failed. Check ffmpeg output above.")
+    }
+}
+
+if plannedSubtitleClearAction {
+    if setDefaultSubtitleTrack(inputFilePath: guardedInputFilePath, ffmpegURL: ffmpegURL, subtitleTrackIndexToSetAsDefault: nil) {
+        subtitleChangeSuccess = true
+    } else {
+        subtitleChangeSuccess = false
+        print("Error: Clearing default subtitle tracks failed. Check ffmpeg output above.")
+    }
+} else if let subtitleIndex = plannedSubtitleActionIndex {
+    if setDefaultSubtitleTrack(inputFilePath: guardedInputFilePath, ffmpegURL: ffmpegURL, subtitleTrackIndexToSetAsDefault: subtitleIndex) {
+        subtitleChangeSuccess = true
+    } else {
+        subtitleChangeSuccess = false
+        print("Error: Setting default subtitle track failed. Check ffmpeg output above.")
+    }
+}
+
+if audioChangeSuccess == false || subtitleChangeSuccess == false {
+    exit(1)
 }
