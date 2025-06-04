@@ -1,21 +1,26 @@
 # Changelang
 
-Changelang is a cli tool to change the default language/audio track for media.
+CLI tool to change default audio/subtitle tracks in media files.
 
-Invoke with a media file as an argument:
+**Usage:**
+`changelang <file> [-a <lang|0>] [-s <lang|0>]`
 
-```
-> changelang media.mkv
-```
+*   `<file>`: Path to media file.
+*   `-a <lang|0>`: Set default audio to language `lang`. `0` clears default audio.
+*   `-s <lang|0>`: Set default subtitle to language `lang`. `0` clears default subtitle.
 
-changelang will list the audio tracks and denote the default track with an asterisk, and list the language and other details for each audio track. 
-It then prompts the user for the new default audio track, which you can specify via number. The file is changed in-place to have a new default language. If no number is specified, the file is not changed.
+If no -a or -s parameters are passed, `changelang` will lists audio and subtitle tracks and prompt for new defaults in turn.
 
-```
-[1] * (fra): opus, 48000 Hz, 5.1, fltp
-[2]   (eng): opus, 48000 Hz, 5.1, fltp
+**Examples:**
+*   `changelang media.mkv` (Interactive mode)
+*   `changelang media.mkv -a eng -s jpn` (Set English audio, Japanese subtitle)
+*   `changelang media.mkv -s 0` (Clear default subtitle)
 
-Set default: 
-```
+## changeall.sh
 
-When passed an optional `-l <language code>`, e.g. `-l eng`, changelang will set the default language of the file to the first audio track that matches the selected language. If no audio track matches the indicated language, no change is made.
+A simple wrapper to:
+* `find` files in current directory tree with a given extention, 
+* for each file: run `changelang`, applying the rest of `changeall.sh`'s arguments
+
+**Example**
+* `changeall.sh mkv -s 0` (Clear subtitles for all mkv files in the current directory tree)
